@@ -1,0 +1,864 @@
+
+
+# AI Agent 各核心模块实现原理详解
+
+---
+
+## 一、Agent 整体架构总览
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      AI Agent                           │
+│                                                         │
+│  ┌───────────┐   ┌───────────┐   ┌───────────────────┐ │
+│  │  感知输入  │──▶│ 规划/推理  │──▶│   行动/输出       │ │
+│  │ Perception│   │ Planning  │   │   Action          │ │
+│  └───────────┘   └─────┬─────┘   └───────────────────┘ │
+│                        │                                │
+│         ┌──────────────┼──────────────┐                 │
+│         ▼              ▼              ▼                 │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐          │
+│  │   记忆     │  │   工具     │  │   RAG     │          │
+│  │  Memory   │  │  Tools    │  │ Retrieval │          │
+│  └───────────┘  └───────────┘  └───────────┘          │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、规划与推理（Planning & Reasoning）—— Agent 的"大脑"
+
+这是 Agent 的核心决策引擎，决定 **做什么、怎么做、按什么顺序做**。
+
+### 2.1 核心推理范式
+
+#### ReAct（Reasoning + Acting）
+
+```
+循环流程：Thought → Action → Observation → Thought → ...
+
+┌─────────────────────────────────────────────────┐
+│  用户问题: "北京今天天气怎么样？适合户外运动吗？"    │
+└──────────────────────┬──────────────────────────┘
+                       ▼
+┌─ Step 1 ─────────────────────────────────────────┐
+│ Thought: 我需要先查询北京今天的天气数据              │
+│ Action:  call weather_api("北京")                 │
+│ Observation: 晴天, 25°C, 空气质量良, 风力3级        │
+└──────────────────────┬───────────────────────────┘
+                       ▼
+┌─ Step 2 ─────────────────────────────────────────┐
+│ Thought: 天气晴朗、温度适宜、空气质量良,适合户外运动  │
+│ Action:  finish(生成最终回答)                      │
+│ Output:  "北京今天晴天25°C,空气质量良,非常适合..."   │
+└──────────────────────────────────────────────────┘
+```
+
+**实现代码示意：**
+
+```python
+REACT_PROMPT = """
+Answer the question using the following format:
+
+Thought: [你的推理过程]
+Action: [tool_name(parameters)]
+Observation: [工具返回的结果]
+... (repeat Thought/Action/Observation as needed)
+Thought: I now know the final answer
+Final Answer: [最终答案]
+"""
+
+def react_loop(question, tools, llm, max_steps=10):
+    prompt = REACT_PROMPT + f"\nQuestion: {question}\n"
+    
+    for step in range(max_steps):
+        # LLM 生成下一步思考和行动
+        response = llm.generate(prompt)
+        
+        # 解析 LLM 输出
+        thought, action = parse_response(response)
+        prompt += response
+        
+        if action.name == "finish":
+            return action.args  # 返回最终答案
+        
+        # 执行工具调用
+        observation = tools[action.name].execute(action.args)
+        prompt += f"\nObservation: {observation}\n"
+    
+    return "达到最大步数限制"
+```
+
+#### Plan-and-Execute（先规划再执行）
+
+```
+┌──────────────┐     ┌──────────────────────────────────┐
+│   Planner    │────▶│  Plan:                           │
+│  (规划器)     │     │   1. 搜索北京旅游景点             │
+│              │     │   2. 查询各景点门票价格            │
+│              │     │   3. 获取交通路线                  │
+│              │     │   4. 整合生成旅行攻略              │
+└──────────────┘     └──────────────┬───────────────────┘
+                                    ▼
+                     ┌──────────────────────────────────┐
+                     │   Executor (逐步执行)             │
+                     │   Step1 → Step2 → Step3 → Step4  │
+                     │          ↓                        │
+                     │   Re-plan (必要时重新规划)         │
+                     └──────────────────────────────────┘
+```
+
+#### 其他推理框架对比
+
+| 框架 | 思路 | 适用场景 |
+|------|------|----------|
+| **ReAct** | 交替思考与行动 | 通用任务，需要动态调整 |
+| **Plan-and-Execute** | 先全局规划，再逐步执行 | 复杂多步任务 |
+| **Tree of Thought** | 树状搜索多条推理路径 | 需要探索的复杂推理 |
+| **Reflexion** | 执行后自我反思改进 | 需要迭代优化的任务 |
+| **LATS** | 蒙特卡洛树搜索 | 决策空间大的任务 |
+
+---
+
+## 三、工具调用（Tool Use / Function Calling）
+
+### 3.1 整体流程
+
+```
+┌──────┐    ┌─────────────────────────────────────────────────────┐
+│ 用户  │    │                     LLM                            │
+│ 输入  │───▶│  1. 理解意图                                       │
+│      │    │  2. 判断是否需要工具                                │
+│      │    │  3. 选择工具 + 生成参数 (结构化JSON)                 │
+└──────┘    └─────────────┬───────────────────────────────────────┘
+                          │ Function Call JSON
+                          ▼
+            ┌─────────────────────────────┐
+            │       工具执行引擎           │
+            │  ┌─────┐ ┌─────┐ ┌──────┐  │
+            │  │搜索  │ │计算  │ │数据库│  │
+            │  │API  │ │工具  │ │查询  │  │
+            │  └─────┘ └─────┘ └──────┘  │
+            └─────────────┬───────────────┘
+                          │ 执行结果
+                          ▼
+            ┌─────────────────────────────┐
+            │  LLM 整合结果,生成最终回答    │
+            └─────────────────────────────┘
+```
+
+### 3.2 Function Calling 实现原理
+
+**核心思想：让 LLM 输出结构化的工具调用指令，而非自然语言。**
+
+```python
+# 1. 工具定义 (Tool Schema)
+tools_schema = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "获取指定城市的天气信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string", 
+                        "description": "城市名称，如：北京"
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "日期，格式YYYY-MM-DD"
+                    }
+                },
+                "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "搜索互联网获取最新信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# 2. LLM 决策调用哪个工具
+response = openai.chat.completions.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": "北京明天天气如何？"}],
+    tools=tools_schema,
+    tool_choice="auto"  # auto / none / 指定工具
+)
+
+# 3. LLM 返回结构化调用 (而非自然语言)
+# response.choices[0].message.tool_calls = [
+#   {
+#     "id": "call_abc123",
+#     "function": {
+#         "name": "get_weather",          ← LLM 选择的工具
+#         "arguments": '{"city":"北京","date":"2024-01-16"}'  ← LLM 生成的参数
+#     }
+#   }
+# ]
+
+# 4. 解析并执行
+tool_call = response.choices[0].message.tool_calls[0]
+func_name = tool_call.function.name        # "get_weather"
+func_args = json.loads(tool_call.function.arguments)  # {"city": "北京", ...}
+
+# 5. 实际调用工具函数
+result = available_tools[func_name](**func_args)
+
+# 6. 将结果返回给 LLM 生成最终回答
+messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+final_response = openai.chat.completions.create(model="gpt-4", messages=messages)
+```
+
+### 3.3 工具选择的底层原理
+
+```
+              Tool Schema 注入到 Prompt/训练中
+                         │
+                         ▼
+┌──────────────────────────────────────────────────┐
+│  System Prompt (简化示意):                        │
+│                                                  │
+│  You have access to the following tools:         │
+│                                                  │
+│  1. get_weather(city, date)                      │
+│     - 获取天气信息                                │
+│                                                  │
+│  2. search_web(query)                            │
+│     - 搜索网络                                    │
+│                                                  │
+│  Based on the user's request, decide whether     │
+│  to call a tool. If yes, output JSON:            │
+│  {"name": "...", "arguments": {...}}             │
+│                                                  │
+│  如果不需要工具,直接回答。                          │
+└──────────────────────────────────────────────────┘
+                         │
+            LLM 经过微调/对齐训练后，能够:
+            ① 判断是否需要工具
+            ② 选择正确的工具
+            ③ 正确填充参数格式
+```
+
+> **关键点**: 现代 LLM (GPT-4, Claude等) 经过了专门的 **Function Calling 微调训练**, 使其能可靠地输出结构化 JSON 而非自然语言。
+
+---
+
+## 四、RAG（检索增强生成）
+
+### 4.1 RAG 全流程架构
+
+```
+                      离线索引阶段
+┌─────────────────────────────────────────────────┐
+│                                                 │
+│  文档 ──▶ 分块(Chunking) ──▶ 嵌入(Embedding) ──▶ 向量数据库  │
+│                                                 │
+│  "深度学习是..."   ["深度学习是...",    [0.12, -0.34,    Pinecone  │
+│  "Transformer..."   "Transformer..."]   0.56, ...]     / Milvus  │
+│                                                 │
+└─────────────────────────────────────────────────┘
+
+                      在线查询阶段
+┌─────────────────────────────────────────────────────────┐
+│                                                         │
+│  用户Query ──▶ 查询Embedding ──▶ 向量检索(Top-K) ──▶ 重排序  │
+│      │                                   │              │
+│      │              ┌────────────────────┘              │
+│      ▼              ▼                                   │
+│  ┌──────────────────────────────────┐                   │
+│  │  Prompt = Query + 检索到的文档块   │                   │
+│  │  "根据以下信息回答问题:           │                   │
+│  │   [Context]: chunk1, chunk2...   │                   │
+│  │   [Question]: 用户的问题"        │                   │
+│  └──────────────┬───────────────────┘                   │
+│                 ▼                                       │
+│           LLM 生成回答                                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 4.2 各环节实现细节
+
+#### (1) 文档分块 (Chunking)
+
+```python
+# 策略对比
+"""
+┌─────────────────────────────────────────────────────────┐
+│  固定大小分块        │  按段落/句子分块     │  语义分块        │
+│  ─────────────      │  ────────────       │  ──────────     │
+│  每512 tokens切一刀  │  按\n\n或句号切分    │  基于语义相似度   │
+│  简单但可能切断语义   │  保持段落完整性      │  动态确定边界     │
+│  overlap=50 tokens  │  长度不均匀          │  计算成本较高     │
+└─────────────────────────────────────────────────────────┘
+"""
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,        # 每块最大字符数
+    chunk_overlap=50,      # 块间重叠字符数（保持上下文连贯）
+    separators=["\n\n", "\n", "。", "，", " "],  # 优先按段落、句子切分
+)
+
+chunks = splitter.split_text(document_text)
+# ["深度学习是机器学习的一个分支...", "Transformer架构由Vaswani等人...", ...]
+```
+
+#### (2) 向量嵌入 (Embedding)
+
+```python
+"""
+文本 → 高维向量空间的映射
+
+     "猫在沙发上睡觉"  →  [0.12, -0.34, 0.78, ..., 0.23]   (1536维)
+     "小猫躺在椅子上"  →  [0.11, -0.33, 0.77, ..., 0.22]   (语义相近 → 向量相近)
+     "量子力学方程"    →  [0.89, 0.45, -0.12, ..., -0.67]   (语义不同 → 向量远离)
+"""
+
+# Embedding 模型原理:
+# 基于 Transformer 编码器, 将文本映射为固定维度的稠密向量
+# 训练目标: 语义相似的文本 → 向量距离近; 不相似的 → 距离远
+
+import openai
+
+def get_embedding(text: str) -> list[float]:
+    response = openai.embeddings.create(
+        model="text-embedding-3-small",  # 或 text-embedding-ada-002
+        input=text
+    )
+    return response.data[0].embedding  # 返回 1536 维向量
+```
+
+#### (3) 向量检索与相似度计算
+
+```python
+"""
+相似度度量方法:
+
+1. 余弦相似度 (最常用):
+   cos(A,B) = (A·B) / (|A|×|B|)
+   范围: [-1, 1], 1表示完全相同
+
+2. 欧氏距离:
+   d(A,B) = √(Σ(ai-bi)²)
+   越小越相似
+
+3. 内积 (点积):
+   A·B = Σ(ai×bi)
+   值越大越相似
+"""
+
+# 使用向量数据库进行高效检索
+import chromadb
+
+# 创建集合并存储
+client = chromadb.Client()
+collection = client.create_collection("my_docs")
+
+collection.add(
+    documents=chunks,                          # 原始文本块
+    embeddings=[get_embedding(c) for c in chunks],  # 对应向量
+    ids=[f"chunk_{i}" for i in range(len(chunks))],
+    metadatas=[{"source": "doc1.pdf", "page": i} for i in range(len(chunks))]
+)
+
+# 检索: 找到与查询最相似的 Top-K 个块
+results = collection.query(
+    query_embeddings=[get_embedding("什么是Transformer?")],
+    n_results=5  # 返回最相似的5个块
+)
+# 底层使用 ANN (近似最近邻) 算法: HNSW, IVF, PQ 等
+```
+
+#### (4) 重排序 (Reranking)
+
+```python
+"""
+为什么需要重排序?
+- Embedding 检索是"粗排": 语义相似 ≠ 最相关
+- Reranker 做"精排": 用交叉编码器精确评估 query-document 相关性
+
+粗排 (Bi-Encoder):          精排 (Cross-Encoder):
+  Query  → [Emb] → vec_q      Query + Doc → [Cross-Encoder] → relevance_score
+  Doc    → [Emb] → vec_d      直接建模query和doc的交互
+  similarity(vec_q, vec_d)     更准确但更慢
+"""
+
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+# 对粗排结果重新打分
+pairs = [(query, doc) for doc in retrieved_docs]
+scores = reranker.predict(pairs)
+
+# 按精排分数重新排序
+reranked_docs = [doc for _, doc in sorted(zip(scores, retrieved_docs), reverse=True)]
+```
+
+#### (5) 生成回答
+
+```python
+RAG_PROMPT = """
+基于以下检索到的上下文信息回答用户的问题。
+如果上下文中没有相关信息，请说明你不确定，不要编造答案。
+
+上下文:
+{context}
+
+用户问题: {question}
+
+回答:
+"""
+
+def rag_answer(question: str):
+    # 1. 检索相关文档
+    relevant_chunks = retrieve(question, top_k=5)
+    
+    # 2. 重排序
+    relevant_chunks = rerank(question, relevant_chunks)[:3]
+    
+    # 3. 组装 Prompt
+    context = "\n\n".join(relevant_chunks)
+    prompt = RAG_PROMPT.format(context=context, question=question)
+    
+    # 4. LLM 生成
+    answer = llm.generate(prompt)
+    return answer
+```
+
+### 4.3 高级 RAG 技术
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Advanced RAG Techniques                   │
+│                                                              │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌────────────┐ │
+│  │ Query 改写       │  │ Hypothetical     │  │ 多路召回    │ │
+│  │ - 同义改写       │  │ Document         │  │ - 关键词    │ │
+│  │ - 子问题拆分     │  │ Embedding (HyDE) │  │ - 向量      │ │
+│  │ - Step-back      │  │ 先让LLM生成假设  │  │ - 知识图谱  │ │
+│  │   abstraction    │  │ 答案,再用其检索   │  │ - 融合排序  │ │
+│  └─────────────────┘  └──────────────────┘  └────────────┘ │
+│                                                              │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌────────────┐ │
+│  │ Self-RAG         │  │ 层次化索引       │  │ 上下文压缩  │ │
+│  │ LLM自己决定:     │  │ - 摘要层索引     │  │ 提取文档中  │ │
+│  │ - 是否需要检索   │  │ - 详情层索引     │  │ 与query最   │ │
+│  │ - 结果是否相关   │  │ - 先粗后细检索   │  │ 相关的部分  │ │
+│  │ - 是否需要补充   │  │                  │  │            │ │
+│  └─────────────────┘  └──────────────────┘  └────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 五、记忆系统（Memory）
+
+### 5.1 记忆类型架构
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        Agent Memory System                       │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              短期记忆 (Short-Term Memory)                 │   │
+│  │                                                          │   │
+│  │  ● 对话上下文窗口 (Conversation Buffer)                   │   │
+│  │    User: 帮我分析这份报告                                  │   │
+│  │    AI: 好的,这份报告的主要结论是...                        │   │
+│  │    User: 第三部分再详细说说  ← 需要知道"第三部分"指什么    │   │
+│  │                                                          │   │
+│  │  ● 工作记忆 (Working Memory)                              │   │
+│  │    当前任务的中间状态、临时变量                             │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              长期记忆 (Long-Term Memory)                   │   │
+│  │                                                          │   │
+│  │  ● 情景记忆 (Episodic): 过去的对话/交互经历               │   │
+│  │  ● 语义记忆 (Semantic): 学到的事实、知识                   │   │
+│  │  ● 程序记忆 (Procedural): 学到的行为模式、偏好             │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 短期记忆实现
+
+```python
+# ========== 策略 1: 完整历史 (ConversationBufferMemory) ==========
+class BufferMemory:
+    """直接保存所有对话历史 — 简单但会超出上下文窗口"""
+    def __init__(self):
+        self.messages = []
+    
+    def add(self, role, content):
+        self.messages.append({"role": role, "content": content})
+    
+    def get_context(self):
+        return self.messages  # 全部返回
+
+
+# ========== 策略 2: 滑动窗口 (ConversationWindowMemory) ==========
+class WindowMemory:
+    """只保留最近 K 轮对话"""
+    def __init__(self, k=10):
+        self.messages = []
+        self.k = k
+    
+    def get_context(self):
+        return self.messages[-(self.k * 2):]  # 每轮2条消息(user+ai)
+
+
+# ========== 策略 3: 摘要记忆 (ConversationSummaryMemory) ==========
+class SummaryMemory:
+    """
+    超出窗口的历史 → 用 LLM 压缩为摘要
+    
+    [摘要: 用户之前讨论了Python项目架构,决定使用FastAPI...]
+    + 最近3轮完整对话
+    """
+    def __init__(self, llm, max_tokens=2000):
+        self.llm = llm
+        self.summary = ""
+        self.recent_messages = []
+        self.max_tokens = max_tokens
+    
+    def add(self, role, content):
+        self.recent_messages.append({"role": role, "content": content})
+        
+        if self._count_tokens(self.recent_messages) > self.max_tokens:
+            # 将较早的消息压缩进摘要
+            old_messages = self.recent_messages[:4]
+            self.recent_messages = self.recent_messages[4:]
+            self.summary = self.llm.generate(
+                f"将以下对话内容合并到现有摘要中:\n"
+                f"现有摘要: {self.summary}\n"
+                f"新对话: {old_messages}\n"
+                f"更新后的摘要:"
+            )
+    
+    def get_context(self):
+        return [
+            {"role": "system", "content": f"对话历史摘要: {self.summary}"},
+            *self.recent_messages
+        ]
+
+
+# ========== 策略 4: Token 缓冲 (ConversationTokenBufferMemory) ==========
+class TokenBufferMemory:
+    """按 Token 数量限制，而非轮数"""
+    def __init__(self, max_tokens=4000):
+        self.messages = []
+        self.max_tokens = max_tokens
+    
+    def add(self, role, content):
+        self.messages.append({"role": role, "content": content})
+        # 从前面丢弃,直到总 token 数 < max_tokens
+        while self._total_tokens() > self.max_tokens:
+            self.messages.pop(0)
+```
+
+### 5.3 长期记忆实现
+
+```python
+"""
+长期记忆核心: 将重要信息持久化存储,需要时检索回来
+
+实现方式:
+1. 向量数据库存储 (最常见)
+2. 知识图谱
+3. 结构化数据库 (SQL)
+"""
+
+class LongTermMemory:
+    def __init__(self, vector_store, embedding_model, llm):
+        self.vector_store = vector_store
+        self.embedding_model = embedding_model
+        self.llm = llm
+    
+    def memorize(self, conversation: list[dict]):
+        """从对话中提取值得记住的信息并存储"""
+        
+        # 1. 用 LLM 提取关键信息
+        extraction_prompt = f"""
+        从以下对话中提取值得长期记住的信息:
+        - 用户偏好 (如: 用户喜欢简洁的回答)
+        - 重要事实 (如: 用户是Python开发者)
+        - 决策结论 (如: 项目决定使用PostgreSQL)
+        
+        对话: {conversation}
+        
+        提取的记忆 (每条一行):
+        """
+        memories = self.llm.generate(extraction_prompt).split("\n")
+        
+        # 2. 向量化并存储
+        for memory in memories:
+            embedding = self.embedding_model.encode(memory)
+            self.vector_store.add(
+                text=memory,
+                embedding=embedding,
+                metadata={
+                    "timestamp": datetime.now().isoformat(),
+                    "type": "episodic",  # episodic / semantic / procedural
+                    "importance": self._score_importance(memory)
+                }
+            )
+    
+    def recall(self, query: str, top_k: int = 5) -> list[str]:
+        """根据当前上下文检索相关记忆"""
+        query_embedding = self.embedding_model.encode(query)
+        
+        results = self.vector_store.search(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            # 可结合时间衰减、重要性权重
+            score_function=lambda sim, meta: (
+                sim * 0.6 +                                      # 语义相关性
+                self._recency_score(meta["timestamp"]) * 0.2 +  # 时间新鲜度
+                meta["importance"] * 0.2                         # 重要性
+            )
+        )
+        return [r.text for r in results]
+    
+    def _recency_score(self, timestamp: str) -> float:
+        """时间衰减: 越近的记忆分数越高"""
+        age_hours = (datetime.now() - datetime.fromisoformat(timestamp)).total_seconds() / 3600
+        return math.exp(-0.01 * age_hours)  # 指数衰减
+```
+
+### 5.4 记忆在 Agent 中的整合
+
+```python
+def agent_with_memory(user_input: str, agent):
+    # 1. 检索长期记忆
+    relevant_memories = agent.long_term_memory.recall(user_input)
+    
+    # 2. 获取短期记忆(对话上下文)
+    recent_context = agent.short_term_memory.get_context()
+    
+    # 3. 组装完整 Prompt
+    system_prompt = f"""
+    你是一个智能助手。
+    
+    关于用户的长期记忆:
+    {chr(10).join(relevant_memories)}
+    """
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *recent_context,
+        {"role": "user", "content": user_input}
+    ]
+    
+    # 4. LLM 生成回答
+    response = llm.generate(messages)
+    
+    # 5. 更新短期记忆
+    agent.short_term_memory.add("user", user_input)
+    agent.short_term_memory.add("assistant", response)
+    
+    # 6. 异步更新长期记忆
+    agent.long_term_memory.memorize([
+        {"role": "user", "content": user_input},
+        {"role": "assistant", "content": response}
+    ])
+    
+    return response
+```
+
+---
+
+## 六、多 Agent 协作（Multi-Agent）
+
+### 6.1 协作模式
+
+```
+模式一: 监督者模式 (Supervisor)
+┌─────────────────────────────────────────┐
+│              Supervisor Agent           │
+│         (分配任务、汇总结果)              │
+│              ┌────┴────┐                │
+│              ▼         ▼                │
+│         ┌────────┐ ┌────────┐          │
+│         │Research│ │ Coder  │          │
+│         │ Agent  │ │ Agent  │          │
+│         └────────┘ └────────┘          │
+└─────────────────────────────────────────┘
+
+模式二: 辩论模式 (Debate)
+┌─────────────────────────────────────────┐
+│   Agent A ◄───── 辩论/讨论 ─────► Agent B │
+│     │                                │    │
+│     └──────► Judge Agent ◄──────────┘    │
+│               (仲裁/总结)                 │
+└─────────────────────────────────────────┘
+
+模式三: 流水线模式 (Pipeline)
+┌─────────────────────────────────────────┐
+│  Agent1 ──▶ Agent2 ──▶ Agent3 ──▶ Output │
+│  (研究)     (写作)     (审校)             │
+└─────────────────────────────────────────┘
+
+模式四: 群聊模式 (Group Chat)
+┌─────────────────────────────────────────┐
+│    共享消息空间 (Shared Message Board)     │
+│   ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐  │
+│   │PM    │ │Dev   │ │Test  │ │Design│  │
+│   │Agent │ │Agent │ │Agent │ │Agent │  │
+│   └──────┘ └──────┘ └──────┘ └──────┘  │
+│   Group Manager 决定下一个发言的Agent      │
+└─────────────────────────────────────────┘
+```
+
+### 6.2 实现示例（Supervisor 模式）
+
+```python
+class SupervisorAgent:
+    def __init__(self, llm, worker_agents: dict):
+        self.llm = llm
+        self.workers = worker_agents  # {"researcher": Agent, "coder": Agent, ...}
+    
+    def run(self, task: str):
+        # 1. Supervisor 规划任务分配
+        plan_prompt = f"""
+        你是一个项目经理。将以下任务分解并分配给合适的团队成员:
+        可用成员: {list(self.workers.keys())}
+        
+        任务: {task}
+        
+        输出JSON格式:
+        [{{"agent": "researcher", "subtask": "..."}}, ...]
+        """
+        plan = json.loads(self.llm.generate(plan_prompt))
+        
+        # 2. 按计划分发给各 Worker Agent
+        results = {}
+        for step in plan:
+            agent_name = step["agent"]
+            subtask = step["subtask"]
+            result = self.workers[agent_name].execute(subtask)
+            results[agent_name] = result
+        
+        # 3. Supervisor 汇总结果
+        summary_prompt = f"汇总以下各团队成员的工作结果:\n{results}\n生成最终报告:"
+        final_report = self.llm.generate(summary_prompt)
+        return final_report
+```
+
+---
+
+## 七、完整 Agent 端到端实现
+
+```python
+class CompleteAgent:
+    """一个集成了所有模块的完整 Agent"""
+    
+    def __init__(self, llm, tools, vector_store, embedding_model):
+        self.llm = llm
+        self.tools = {t.name: t for t in tools}
+        self.short_memory = SummaryMemory(llm)
+        self.long_memory = LongTermMemory(vector_store, embedding_model, llm)
+        self.rag = RAGModule(vector_store, embedding_model)
+    
+    def run(self, user_input: str) -> str:
+        # ===== Phase 1: 上下文准备 =====
+        # 检索长期记忆
+        memories = self.long_memory.recall(user_input)
+        # 获取短期对话上下文
+        context = self.short_memory.get_context()
+        # RAG 检索相关知识
+        knowledge = self.rag.retrieve(user_input)
+        
+        # ===== Phase 2: 组装系统提示 =====
+        system = f"""你是一个智能助手。
+
+用户的历史记忆: {memories}
+相关知识库内容: {knowledge}
+
+可用工具: {[t.schema for t in self.tools.values()]}
+
+使用 ReAct 格式推理:
+Thought: ...
+Action: tool_name(args) 或 finish(answer)
+Observation: ...
+"""
+        
+        # ===== Phase 3: ReAct 推理循环 =====
+        messages = [{"role": "system", "content": system}] + context
+        messages.append({"role": "user", "content": user_input})
+        
+        for step in range(10):  # 最多10步
+            response = self.llm.generate(messages)
+            thought, action = self.parse(response)
+            
+            if action.name == "finish":
+                answer = action.args
+                break
+            
+            # 执行工具
+            observation = self.tools[action.name].execute(action.args)
+            messages.append({"role": "assistant", "content": response})
+            messages.append({"role": "user", "content": f"Observation: {observation}"})
+        
+        # ===== Phase 4: 更新记忆 =====
+        self.short_memory.add("user", user_input)
+        self.short_memory.add("assistant", answer)
+        self.long_memory.memorize(user_input, answer)
+        
+        return answer
+```
+
+---
+
+## 八、各模块关系与数据流总结
+
+```
+用户输入
+   │
+   ▼
+┌──────────────────────────────────────────────────────────┐
+│  ①【感知层】解析用户意图                                   │
+│      └── 多模态理解 (文本/图像/语音)                       │
+│                                                          │
+│  ②【记忆层】检索相关上下文                                 │
+│      ├── 短期记忆 → 最近对话                              │
+│      └── 长期记忆 → 历史经验 (向量检索 + 时间衰减)          │
+│                                                          │
+│  ③【知识层】RAG检索外部知识                                │
+│      └── Query → Embedding → 向量检索 → Rerank → Top-K    │
+│                                                          │
+│  ④【推理层】LLM 规划与决策                                 │
+│      └── ReAct / Plan-and-Execute / Tree-of-Thought       │
+│                                                          │
+│  ⑤【行动层】执行工具调用                                   │
+│      └── Function Calling → 工具执行 → 结果返回            │
+│                                                          │
+│  ⑥【生成层】整合所有信息,生成最终回答                       │
+│                                                          │
+│  ⑦【反思层】评估输出质量,必要时重试                         │
+│      └── Self-critique / Verification                     │
+│                                                          │
+│  ⑧【记忆更新】将本次交互存入记忆系统                        │
+└──────────────────────────────────────────────────────────┘
+   │
+   ▼
+最终输出给用户
+```
+
+> **核心要点**：Agent 的本质是 **LLM 作为推理引擎** + **外部模块扩展能力边界**：工具扩展了"行动力"，RAG 扩展了"知识面"，记忆扩展了"时间跨度"，多Agent扩展了"协作能力"。每个模块都可独立优化，组合后形成强大的智能系统。

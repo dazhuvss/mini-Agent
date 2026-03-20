@@ -40,20 +40,9 @@ class Agent:
                 messages, temperature=0.3, stop=["\nObservation:"]
             )
 
+            # 可能因为 stop 过早截断，导致返回空串
             if not llm_output or not llm_output.strip():
-                knowledge_tool = self.tools.get("knowledge_search")
-                if knowledge_tool is not None:
-                    fallback = self._execute_tool("knowledge_search", user_input)
-                    if fallback and fallback not in (
-                        "知识库中未找到相关内容。",
-                        "知识库未初始化。",
-                    ):
-                        final_answer = f"我从知识库里找到这些相关内容：\n{fallback}"
-                    else:
-                        final_answer = fallback or "抱歉，我暂时没有从知识库中检索到相关内容。"
-                    break
-                final_answer = "抱歉，我暂时没有从知识库中检索到相关内容。"
-                break
+                llm_output = self.llm.chat(messages, temperature=0.5, stop=None)
 
             self._print_step(step, llm_output)
 
@@ -79,8 +68,6 @@ class Agent:
 
         if final_answer is None:
             final_answer = "抱歉，我在有限步骤内未能完成推理。请尝试简化问题或提供更多信息。"
-        elif not final_answer.strip():
-            final_answer = "抱歉，我在有限步骤内未能生成有效回答。请尝试简化问题或提供更多信息。"
 
         # ── Phase 4: 更新记忆 ──
         self.short_memory.add("user", user_input)

@@ -1,0 +1,52 @@
+# 人工智能与大语言模型基础知识
+
+## 什么是人工智能
+
+人工智能（Artificial Intelligence，AI）是计算机科学的一个分支，致力于创建能够模拟人类智能行为的系统。AI 的研究领域包括机器学习、自然语言处理、计算机视觉、机器人学、专家系统等。人工智能的概念最早由约翰·麦卡锡（John McCarthy）在 1956 年的达特茅斯会议上提出。
+
+## 机器学习
+
+机器学习（Machine Learning）是人工智能的核心子领域，它使计算机系统能够从数据中自动学习和改进，而无需显式编程。机器学习主要分为三大类：监督学习（Supervised Learning）、无监督学习（Unsupervised Learning）和强化学习（Reinforcement Learning）。常见的机器学习算法包括线性回归、决策树、随机森林、支持向量机（SVM）和 K 近邻（KNN）。
+
+## 深度学习
+
+深度学习（Deep Learning）是机器学习的一个子集，使用多层神经网络来学习数据的层次化表示。深度学习在图像识别、语音识别、自然语言处理等领域取得了突破性成果。关键的深度学习架构包括卷积神经网络（CNN）、循环神经网络（RNN）、长短期记忆网络（LSTM）和 Transformer。
+
+## Transformer 架构
+
+Transformer 是由 Google 团队在 2017 年论文《Attention Is All You Need》中提出的神经网络架构。它完全基于自注意力机制（Self-Attention），摒弃了传统的循环和卷积结构。Transformer 的核心组件包括：
+
+1. 自注意力机制（Self-Attention）：允许模型在处理每个位置时关注输入序列的所有位置，计算公式为 Attention(Q,K,V) = softmax(QK^T / sqrt(d_k))V。
+2. 多头注意力（Multi-Head Attention）：并行运行多个注意力函数，捕获不同子空间的信息。
+3. 位置编码（Positional Encoding）：由于 Transformer 没有循环结构，需要通过位置编码来注入序列位置信息。
+4. 前馈神经网络（Feed-Forward Network）：每个注意力层后接一个全连接前馈网络。
+5. 残差连接和层归一化（Residual Connection & Layer Normalization）。
+
+Transformer 架构是现代大语言模型的基础。
+
+## 大语言模型（LLM）
+
+大语言模型（Large Language Model，LLM）是基于 Transformer 架构、在海量文本数据上训练的超大规模语言模型。代表性的 LLM 包括：
+
+- GPT 系列（OpenAI）：GPT-3 有 1750 亿参数，GPT-4 是多模态模型。
+- BERT（Google）：双向编码器，擅长理解任务。
+- LLaMA（Meta）：开源大模型系列。
+- Claude（Anthropic）：注重安全和有用性的对话模型。
+- DeepSeek（深度求索）：国产开源大模型。
+
+LLM 的训练通常分为两个阶段：预训练（Pre-training）和微调（Fine-tuning）。预训练使用大规模语料通过自回归或掩码语言模型目标进行；微调则使用特定任务数据进行优化，包括指令微调（Instruction Tuning）和基于人类反馈的强化学习（RLHF）。
+
+## AI Agent
+
+AI Agent（智能体）是基于大语言模型构建的自主智能系统。与简单的问答不同，Agent 具备以下核心能力：
+
+1. 规划与推理：能够将复杂任务分解为子任务，制定执行计划。常用的推理框架包括 ReAct（Reasoning + Acting）、Plan-and-Execute、Tree of Thought 等。
+2. 工具使用：能够调用外部工具（搜索引擎、计算器、API 等）来扩展自身能力。
+3. 记忆系统：包括短期记忆（对话上下文）和长期记忆（持久化知识），使 Agent 能够在多轮对话中保持连贯性。
+4. 检索增强生成（RAG）：通过检索外部知识库来补充模型知识，减少幻觉。
+
+## 向量数据库与嵌入
+
+向量嵌入（Embedding）是将文本、图像等非结构化数据映射到高维向量空间的技术。语义相似的内容在向量空间中距离相近。常用的文本嵌入模型包括 OpenAI 的 text-embedding-3-small（1536 维）和开源的 BGE、E5 等模型。
+
+向量数据库专门用于存储和检索高维向量，支持高效的近似最近邻（ANN）搜索。常见的向量数据库包括 Pinecone、Milvus、Weaviate、ChromaDB 和 FAISS。检索时常用的相似度度量包括余弦相似度、欧氏距离和内积。
